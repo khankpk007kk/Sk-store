@@ -1,6 +1,9 @@
 import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="SK Store", page_icon="🛍️", layout="wide")
@@ -16,7 +19,6 @@ st.markdown("""
         position: sticky; top: 0; z-index: 100;
     }
 
-    /* --- Hero banner --- */
     .sk-hero {
         background: linear-gradient(135deg,#111 0%,#333 100%);
         border-radius: 16px; padding: 34px 30px; margin-bottom: 22px;
@@ -25,15 +27,6 @@ st.markdown("""
     .sk-hero h1 { color: white; margin-bottom: 4px; font-size: 2.1rem; }
     .sk-hero p { color: #ddd; margin: 0; font-size: 0.95rem; }
 
-    /* --- Category pills --- */
-    div[data-testid="stRadio"] > div { flex-wrap: wrap; gap: 8px; }
-    div[data-testid="stRadio"] label {
-        background: white; border: 1px solid #e2e2e2; border-radius: 999px;
-        padding: 6px 16px !important; margin: 0 !important; font-size: 0.85rem;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-    }
-
-    /* --- Product cards --- */
     div[data-testid="stVerticalBlockBorderWrapper"] {
         background: white; border-radius: 14px; padding: 14px;
         box-shadow: 0 4px 15px rgba(0,0,0,0.05); transition: transform 0.15s, box-shadow 0.15s;
@@ -53,7 +46,6 @@ st.markdown("""
     .sk-price-old { font-size: 0.85rem; color: #999; text-decoration: line-through; }
     .sk-stock { color: #6b7280; font-size: 0.78rem; margin-bottom: 4px; }
 
-    /* --- Buttons --- */
     button[kind="primary"] {
         background-color: #000 !important; color: white !important;
         border-radius: 8px !important; font-weight: 600; border: none !important;
@@ -64,7 +56,6 @@ st.markdown("""
         border: 1px solid #ddd !important; border-radius: 8px !important;
     }
 
-    /* --- Footer --- */
     .sk-footer {
         margin-top: 40px; padding: 24px 10px; text-align: center;
         color: #888; font-size: 0.8rem; border-top: 1px solid #eee;
@@ -80,7 +71,7 @@ try:
     SUPABASE_KEY = st.secrets["supabase"]["key"]
     SUPABASE_ADMIN_KEY = st.secrets["supabase"]["admin_key"]
 except KeyError:
-    st.error("⚠️ Secrets missing! Configure in Streamlit Cloud Settings > Secrets.")
+    st.error("⚠️ Supabase secrets missing! Configure in Streamlit Cloud Settings > Secrets.")
     st.stop()
 
 supabase_public = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -100,7 +91,6 @@ def get_youtube_embed(url):
     return f"https://www.youtube.com/embed/{video_id}?autoplay=1&mute=1&rel=0" if video_id else None
 
 def price_block(p):
-    """Renders a ToyZone-style price row: sale badge + old/new price if a discount exists."""
     old_price = p.get('original_price')
     now = p['price']
     if old_price and old_price > now:
@@ -114,6 +104,100 @@ def price_block(p):
     else:
         st.markdown(f"""<div class="sk-price-row"><span class="sk-price-now">Rs. {now:,.0f}</span></div>""",
                     unsafe_allow_html=True)
+
+# --- EMAIL SENDING (Gmail SMTP) ---
+def send_order_emails(order_id, customer_name, customer_email, phone, address, items, total):
+    """
+    Sends a nice confirmation email to the customer (if they gave an email)
+    and a packing-alert email to the store admin, with full order details.
+    Returns (success: bool, message: str) — never raises, so checkout never breaks
+    even if Gmail secrets are missing or sending fails.
+    """
+    try:
+        gmail_sender = st.secrets["gmail"]["sender_email"]
+        gmail_password = st.secrets["gmail"]["app_password"]
+        admin_email = st.secrets["gmail"]["admin_email"]
+    except KeyError:
+        return False, "Gmail secrets not configured — skipped sending emails."
+
+    items_rows = "".join(
+        f"<tr><td style='padding:8px;border-bottom:1px solid #eee;'>{it['name']}</td>"
+        f"<td style='padding:8px;border-bottom:1px solid #eee;text-align:right;'>Rs. {it['price']:,.2f}</td></tr>"
+        for it in items
+    )
+
+    customer_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;border:1px solid #eee;border-radius:12px;overflow:hidden;">
+      <div style="background:#111;color:white;padding:20px;text-align:center;">
+        <h2 style="margin:0;">🛍️ SK Store</h2>
+      </div>
+      <div style="padding:24px;">
+        <h3 style="color:#111;">Thank you, {customer_name}! 🎉</h3>
+        <p>Your order <b>#{order_id}</b> has been received and is now being processed.</p>
+        <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+          <tr style="background:#f4f4f4;">
+            <th style="text-align:left;padding:8px;">Item</th>
+            <th style="text-align:right;padding:8px;">Price</th>
+          </tr>
+          {items_rows}
+        </table>
+        <p style="font-size:1.1rem;text-align:right;"><b>Total: Rs. {total:,.2f}</b></p>
+        <p>📦 <b>Delivery Address:</b> {address}<br>📞 <b>Contact:</b> {phone}</p>
+        <p style="color:#666;">We'll notify you once your order ships. Thank you for shopping with us!</p>
+      </div>
+    </div>
+    """
+
+    admin_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;border:1px solid #eee;border-radius:12px;overflow:hidden;">
+      <div style="background:#e11d48;color:white;padding:20px;text-align:center;">
+        <h2 style="margin:0;">📦 New Order — Packing Required</h2>
+      </div>
+      <div style="padding:24px;">
+        <p><b>Order ID:</b> {order_id}</p>
+        <p>
+          <b>Customer:</b> {customer_name}<br>
+          <b>Phone:</b> {phone}<br>
+          <b>Email:</b> {customer_email or 'Not provided'}<br>
+          <b>Address:</b> {address}
+        </p>
+        <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+          <tr style="background:#f4f4f4;">
+            <th style="text-align:left;padding:8px;">Item</th>
+            <th style="text-align:right;padding:8px;">Price</th>
+          </tr>
+          {items_rows}
+        </table>
+        <p style="font-size:1.1rem;text-align:right;"><b>Total: Rs. {total:,.2f}</b></p>
+        <p style="color:#e11d48;"><b>👉 Please prepare this order for packing & dispatch.</b></p>
+      </div>
+    </div>
+    """
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(gmail_sender, gmail_password)
+
+        if customer_email:
+            msg1 = MIMEMultipart("alternative")
+            msg1["Subject"] = f"✅ Order Confirmed — SK Store (Order #{order_id})"
+            msg1["From"] = gmail_sender
+            msg1["To"] = customer_email
+            msg1.attach(MIMEText(customer_body, "html"))
+            server.sendmail(gmail_sender, customer_email, msg1.as_string())
+
+        msg2 = MIMEMultipart("alternative")
+        msg2["Subject"] = f"📦 New Order #{order_id} — Packing Required"
+        msg2["From"] = gmail_sender
+        msg2["To"] = admin_email
+        msg2.attach(MIMEText(admin_body, "html"))
+        server.sendmail(gmail_sender, admin_email, msg2.as_string())
+
+        server.quit()
+        return True, "Emails sent successfully."
+    except Exception as e:
+        return False, str(e)
 
 # --- ADMIN PANEL ---
 def admin_panel():
@@ -149,8 +233,7 @@ def admin_panel():
                     with st.spinner("Saving..."):
                         try:
                             res = supabase_admin.table("products").insert(prod).execute()
-                        except Exception as e:
-                            # Fallback: 'original_price' column probably doesn't exist yet.
+                        except Exception:
                             if "original_price" in prod:
                                 prod.pop("original_price")
                                 res = supabase_admin.table("products").insert(prod).execute()
@@ -290,17 +373,33 @@ def show_cart():
         st.divider(); st.markdown(f"### Total: Rs. {total:,.2f}")
 
         with st.form("co"):
-            nm = st.text_input("Name *"); ph = st.text_input("Phone *"); ad = st.text_area("Address *")
+            nm = st.text_input("Name *")
+            em = st.text_input("Email (for order confirmation)")
+            ph = st.text_input("Phone *")
+            ad = st.text_area("Address *")
             if st.form_submit_button("Checkout ✅", type="primary"):
                 if nm and ph and ad:
-                    od = {"customer_name": nm, "phone": ph, "address": ad,
-                          "items": [{"name": x['name'], "price": x['price']} for x in st.session_state.cart],
-                          "total_amount": total, "status": "Pending"}
+                    items_payload = [{"name": x['name'], "price": x['price']} for x in st.session_state.cart]
+                    od = {"customer_name": nm, "email": em or None, "phone": ph, "address": ad,
+                          "items": items_payload, "total_amount": total, "status": "Pending"}
                     try:
-                        supabase_public.table("orders").insert(od).execute()
-                        st.success("Order Placed! 🎉"); st.session_state.cart = []; st.rerun()
+                        # Uses the ADMIN (service_role) client so this never fails on
+                        # Row Level Security, regardless of anon-key policy config.
+                        res = supabase_admin.table("orders").insert(od).execute()
+                        order_id = res.data[0]['id']
+
+                        ok, msg = send_order_emails(order_id, nm, em, ph, ad, items_payload, total)
+                        if not ok:
+                            st.warning(f"Order placed, but email notification failed: {msg}")
+
+                        st.success("Order Placed! 🎉 A confirmation has been sent.")
+                        st.session_state.cart = []
+                        st.rerun()
                     except Exception as e:
-                        st.error(str(e))
+                        st.error("❌ Failed to place order. Real error below 👇")
+                        st.exception(e)
+                else:
+                    st.warning("⚠️ Please fill Name, Phone and Address.")
 
 # --- MAIN ROUTER ---
 show_cart()
