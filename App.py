@@ -1,109 +1,223 @@
 import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
-from PIL import Image
-import io
-import json
+
+# --- CUSTOM CSS FOR SK STORE EU LOOK ---
+st.markdown("""
+<style>
+    /* Global Styles */
+    .main { background-color: #f8f9fa; }
+    h1, h2, h3 { font-family: 'Inter', sans-serif; color: #1a1a1a; }
+    
+    /* Sticky Header */
+    header[data-testid="stHeader"] { 
+        background-color: white; 
+        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+        position: sticky; top: 0; z-index: 100;
+    }
+    
+    /* Product Cards */
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        background: white; border-radius: 12px; padding: 15px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.05); transition: transform 0.2s;
+        border: none !important;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"]:hover {
+        transform: translateY(-5px); box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+    }
+    
+    /* Buttons */
+    button[kind="primary"] {
+        background-color: #000 !important; color: white !important;
+        border-radius: 8px !important; font-weight: 600; border: none !important;
+    }
+    button[kind="secondary"] {
+        background-color: transparent !important; color: #333 !important;
+        border: 1px solid #ddd !important; border-radius: 8px !important;
+    }
+    
+    /* Hide Streamlit Footer/Menu for Clean Look */
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+    .viewerBadge_container__1QSob { display: none; }
+</style>
+""", unsafe_allow_html=True)
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="SK Store", page_icon="🛍️", layout="wide")
 
-# Secrets load karna
 try:
     SUPABASE_URL = st.secrets["supabase"]["url"]
     SUPABASE_KEY = st.secrets["supabase"]["key"]
     SUPABASE_ADMIN_KEY = st.secrets["supabase"]["admin_key"]
 except KeyError:
-    st.error("❌ Supabase secrets missing! .streamlit/secrets.toml check karein.")
+    st.error("⚠️ Secrets missing! Please configure in Streamlit Cloud settings.")
     st.stop()
 
-# Clients initialize karna
-supabase_public: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_ADMIN_KEY)
+supabase_public = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase_admin = create_client(SUPABASE_URL, SUPABASE_ADMIN_KEY)
 
-# --- SESSION STATE INITIALIZATION ---
-if 'cart' not in st.session_state:
-    st.session_state.cart = []
-if 'page' not in st.session_state:
-    st.session_state.page = 'home'
+if 'cart' not in st.session_state: st.session_state.cart = []
+if 'page' not in st.session_state: st.session_state.page = 'home'
 
 # --- HELPER FUNCTIONS ---
-def upload_image_to_supabase(file, product_id):
-    """Image ko Supabase Storage mein upload karta hai"""
-    try:
-        file_extension = file.name.split('.')[-1]
-        path = f"{product_id}/{file.name}"
-        
-        response = supabase_admin.storage.from_('sk-store-images').upload(
-            path=path,
-            file=file.getvalue(),
-            file_options={"content-type": file.type}
-        )
-        
-        # Public URL generate karna
-        public_url = supabase_admin.storage.from_('sk-store-images').get_public_url(path)
-        return public_url
-    except Exception as e:
-        st.error(f"Image upload failed: {e}")
-        return None
-
 def get_youtube_embed(url):
-    """YouTube URL se embed code banata hai"""
-    if not url or 'youtube.com' not in url and 'youtu.be' not in url:
-        return None
-    
+    if not url or ('youtube.com' not in url and 'youtu.be' not in url): return None
     video_id = ""
-    if 'youtu.be/' in url:
-        video_id = url.split('youtu.be/')[1].split('?')[0]
-    elif 'v=' in url:
-        video_id = url.split('v=')[1].split('&')[0]
-    
-    if video_id:
-        return f"https://www.youtube.com/embed/{video_id}?autoplay=1&mute=1&rel=0"
-    return None
+    if 'youtu.be/' in url: video_id = url.split('youtu.be/')[1].split('?')[0]
+    elif 'v=' in url: video_id = url.split('v=')[1].split('&')[0]
+    return f"https://www.youtube.com/embed/{video_id}?autoplay=1&mute=1&rel=0" if video_id else None
 
-# --- ADMIN PANEL PAGE ---
+# --- ADMIN PANEL ---
 def admin_panel():
-    st.title("🔐 SK Store Admin Panel")
-    
-    tab1, tab2 = st.tabs(["➕ Add Product", " Manage Orders"])
+    st.title("🔐 Admin Dashboard")
+    tab1, tab2 = st.tabs(["➕ Add Product", "📦 Orders"])
     
     with tab1:
-        st.subheader("New Product Add Karein")
-        
         col1, col2 = st.columns(2)
         with col1:
             name = st.text_input("Product Name *")
-            price = st.number_input("Price (PKR) *", min_value=0.0, step=0.01)
-            category = st.selectbox("Category", ["Electronics", "Fashion", "Accessories", "Home", "Other"])
-            stock = st.number_input("Stock Quantity", min_value=0, value=10)
-        
+            price = st.number_input("Price (PKR) *", min_value=0.0)
+            category = st.selectbox("Category", ["Electronics", "Fashion", "Accessories", "Home"])
+            stock = st.number_input("Stock", min_value=0, value=10)
         with col2:
-            description = st.text_area("Description")
-            youtube_url = st.text_input("YouTube Video Link (Optional)")
-            is_active = st.checkbox("Active Product", value=True)
+            desc = st.text_area("Description")
+            yt_url = st.text_input("YouTube Link")
+            active = st.checkbox("Active", value=True)
         
-        # Image Upload Section
         st.markdown("---")
-        st.write(" Product Images (Max 5)")
-        uploaded_files = st.file_uploader(
-            "Images select karein", 
-            type=['png', 'jpg', 'jpeg'], 
-            accept_multiple_files=True
-        )
+        files = st.file_uploader("Upload Images (Max 5)", type=['png','jpg'], accept_multiple_files=True)
         
         if st.button("💾 Save Product", type="primary"):
-            if not name or price <= 0:
-                st.warning("Name aur Price zaroori hain!")
-            else:
-                with st.spinner("Product save ho raha hai..."):
-                    # Pehle product insert karein taake ID mile
-                    product_data = {
-                        "name": name,
-                        "description": description,
-                        "price": float(price),
-                        "category": category,
-                        "stock": int(stock),
+            if name and price > 0:
+                with st.spinner("Saving..."):
+                    prod = {"name": name, "description": desc, "price": float(price), 
+                            "category": category, "stock": int(stock), "youtube_url": yt_url, 
+                            "is_active": active, "images": []}
+                    res = supabase_admin.table("products").insert(prod).execute()
+                    pid = res.data[0]['id']
+                    
+                    urls = []
+                    if files:
+                        for f in files[:5]:
+                            path = f"{pid}/{f.name}"
+                            supabase_admin.storage.from_('sk-store-images').upload(path, f.getvalue())
+                            urls.append(supabase_admin.storage.from_('sk-store-images').get_public_url(path))
+                    
+                    supabase_admin.table("products").update({"images": urls}).eq("id", pid).execute()
+                    st.success(f"✅ '{name}' Added!")
+                    st.rerun()
+
+    with tab2:
+        orders = supabase_admin.table("orders").select("*").order("created_at", desc=True).limit(20).execute()
+        if orders.data: st.dataframe(pd.DataFrame(orders.data), use_container_width=True)
+        else: st.info("No orders yet.")
+
+# --- CUSTOMER STORE ---
+def customer_store():
+    # Hero Section
+    try: st.image("store logo.png", use_container_width=True)
+    except: st.title("Welcome to SK Store"); st.write("Premium Quality Marketplace")
+    
+    st.markdown("---")
+    
+    # Search & Filter Bar
+    c1, c2 = st.columns([3, 1])
+    search = c1.text_input("🔍 Search products...", key="search")
+    cat_filter = c2.selectbox("Category", ["All", "Electronics", "Fashion", "Accessories", "Home"])
+    
+    # Fetch Products
+    q = supabase_public.table("products").select("*").eq("is_active", True)
+    if cat_filter != "All": q = q.eq("category", cat_filter)
+    if search: q = q.ilike("name", f"%{search}%")
+    products = q.execute().data
+    
+    if not products: st.info("No products found."); return
+    
+    # Product Grid
+    cols = st.columns(3)
+    for i, p in enumerate(products):
+        with cols[i % 3]:
+            with st.container():  # Uses CSS class defined above
+                if p.get('images'): st.image(p['images'][0], use_container_width=True)
+                else: st.image("https://via.placeholder.com/300x200?text=SK+Store", use_container_width=True)
+                
+                st.markdown(f"### {p['name']}")
+                st.caption(f"📂 {p.get('category')} | 📦 {p.get('stock')} left")
+                st.markdown(f"**Rs. {p['price']:,.2f}**")
+                
+                bc1, bc2 = st.columns(2)
+                with bc1:
+                    if st.button("View", key=f"v_{p['id']}"):
+                        st.session_state.selected_product = p; st.session_state.page = 'detail'; st.rerun()
+                with bc2:
+                    if st.button("Add ", key=f"a_{p['id']}"):
+                        st.session_state.cart.append(p); st.toast("Added!", icon="")
+
+# --- PRODUCT DETAIL ---
+def product_detail():
+    p = st.session_state.get('selected_product')
+    if not p: st.session_state.page = 'home'; st.rerun(); return
+    
+    st.button("← Back", on_click=lambda: setattr(st.session_state, 'page', 'home'))
+    c1, c2 = st.columns([1, 1])
+    
+    with c1:
+        imgs = p.get('images', [])
+        if imgs: 
+            idx = st.session_state.get('img_idx', 0)
+            st.image(imgs[idx], use_container_width=True)
+            if len(imgs) > 1:
+                thumbs = st.columns(min(len(imgs), 5))
+                for t, img in enumerate(thumbs):
+                    with img:
+                        if st.button(f"{t+1}", key=f"th_{t}"): st.session_state.img_idx = t; st.rerun()
+    
+    with c2:
+        st.title(p['name'])
+        st.markdown(f"## Rs. {p['price']:,.2f}")
+        st.write(p.get('description'))
+        
+        if p.get('youtube_url'):
+            embed = get_youtube_embed(p['youtube_url'])
+            if embed:
+                st.components.v1.html(f'<iframe width="100%" height="315" src="{embed}" frameborder="0" allowfullscreen></iframe>', height=350)
+        
+        if st.button("🛒 Add to Cart", type="primary", use_container_width=True):
+            st.session_state.cart.append(p); st.success("Added!"); st.rerun()
+
+# --- CART SIDEBAR ---
+def show_cart():
+    with st.sidebar:
+        st.header("🛒 Cart")
+        if not st.session_state.cart: st.write("Empty cart "); return
+        
+        total = sum(i['price'] for i in st.session_state.cart)
+        for i, item in enumerate(st.session_state.cart):
+            cx, cy = st.columns([3, 1])
+            cx.write(f"{item['name']}"); cx.caption(f"Rs. {item['price']:,.2f}")
+            if cy.button("×", key=f"r_{i}"): st.session_state.cart.pop(i); st.rerun()
+        
+        st.divider(); st.markdown(f"### Total: Rs. {total:,.2f}")
+        
+        with st.form("co"):
+            nm = st.text_input("Name *"); ph = st.text_input("Phone *"); ad = st.text_area("Address *")
+            if st.form_submit_button("Checkout ✅", type="primary"):
+                if nm and ph and ad:
+                    od = {"customer_name": nm, "phone": ph, "address": ad, 
+                          "items": [{"name": x['name'], "price": x['price']} for x in st.session_state.cart], 
+                          "total_amount": total, "status": "Pending"}
+                    try:
+                        supabase_public.table("orders").insert(od).execute()
+                        st.success("Order Placed! 🎉"); st.session_state.cart = []; st.rerun()
+                    except Exception as e: st.error(str(e))
+
+# --- MAIN ROUTER ---
+show_cart()
+nav = st.sidebar.radio("Menu", ["🏠 Home", "🔐 Admin"], index=0)
+if nav == "🔐 Admin": admin_panel()
+elif st.session_state.page == 'detail': product_detail()
+else: customer_store()                        "stock": int(stock),
                         "youtube_url": youtube_url,
                         "is_active": is_active,
                         "images": []
