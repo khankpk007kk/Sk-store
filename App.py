@@ -138,24 +138,46 @@ def admin_panel():
 
         if st.button("💾 Save Product", type="primary"):
             if name and price > 0:
-                with st.spinner("Saving..."):
-                    prod = {"name": name, "description": desc, "price": float(price),
-                            "original_price": float(original_price) if original_price > 0 else None,
-                            "category": category, "stock": int(stock), "youtube_url": yt_url,
-                            "is_active": active, "images": []}
-                    res = supabase_admin.table("products").insert(prod).execute()
-                    pid = res.data[0]['id']
+                prod = {"name": name, "description": desc, "price": float(price),
+                        "category": category, "stock": int(stock), "youtube_url": yt_url,
+                        "is_active": active, "images": []}
+                if original_price > 0:
+                    prod["original_price"] = float(original_price)
 
-                    urls = []
-                    if files:
-                        for f in files[:5]:
-                            path = f"{pid}/{f.name}"
-                            supabase_admin.storage.from_('sk-store-images').upload(path, f.getvalue())
-                            urls.append(supabase_admin.storage.from_('sk-store-images').get_public_url(path))
+                pid = None
+                try:
+                    with st.spinner("Saving..."):
+                        try:
+                            res = supabase_admin.table("products").insert(prod).execute()
+                        except Exception as e:
+                            # Fallback: 'original_price' column probably doesn't exist yet.
+                            if "original_price" in prod:
+                                prod.pop("original_price")
+                                res = supabase_admin.table("products").insert(prod).execute()
+                                st.warning("⚠️ Saved without sale price — add an 'original_price' "
+                                           "numeric column in Supabase to enable SALE badges.")
+                            else:
+                                raise
+                        pid = res.data[0]['id']
 
-                    supabase_admin.table("products").update({"images": urls}).eq("id", pid).execute()
+                        urls = []
+                        if files:
+                            for f in files[:5]:
+                                path = f"{pid}/{f.name}"
+                                supabase_admin.storage.from_('sk-store-images').upload(path, f.getvalue())
+                                urls.append(supabase_admin.storage.from_('sk-store-images').get_public_url(path))
+
+                        supabase_admin.table("products").update({"images": urls}).eq("id", pid).execute()
                     st.success(f"✅ '{name}' Added!")
                     st.rerun()
+                except Exception as e:
+                    st.error("❌ Failed to save product. Real error below 👇")
+                    st.exception(e)
+                    if pid:
+                        st.warning(f"Note: a product row (id={pid}) may have been created "
+                                   f"before this failed — check your Supabase 'products' table.")
+            else:
+                st.warning("⚠️ Please fill Product Name and a Price greater than 0.")
 
     with tab2:
         orders = supabase_admin.table("orders").select("*").order("created_at", desc=True).limit(20).execute()
