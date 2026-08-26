@@ -115,7 +115,8 @@ supabase_public = create_client(SUPABASE_URL, SUPABASE_KEY)
 supabase_admin = create_client(SUPABASE_URL, SUPABASE_ADMIN_KEY)
 
 for key, default in [('cart', []), ('page', 'home'), ('cat_filter', 'All'), ('is_admin', False),
-                      ('flash_add', None), ('detected_city', ''), ('detected_street', '')]:
+                      ('flash_add', None), ('detected_city', ''), ('detected_street', ''),
+                      ('order_success', None)]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -162,6 +163,18 @@ def add_to_cart(p):
 
 def cart_subtotal():
     return sum(i['price'] for i in st.session_state.cart)
+
+def decrement_stock(cart_items):
+    """Reduces stock for each purchased product so remaining quantity updates live on the storefront."""
+    from collections import Counter
+    counts = Counter(item['id'] for item in cart_items if item.get('id'))
+    for pid, qty in counts.items():
+        try:
+            current = supabase_admin.table("products").select("stock").eq("id", pid).single().execute().data
+            new_stock = max((current.get("stock") or 0) - qty, 0)
+            supabase_admin.table("products").update({"stock": new_stock}).eq("id", pid).execute()
+        except Exception:
+            pass  # never block order success over a stock-count hiccup
 
 # ============================================================
 # EMAIL (Gmail SMTP)
@@ -221,19 +234,42 @@ def send_order_emails(order_id, customer_name, customer_email, phone, alt_phone,
       </div>
     </div>
     """
+    # Plain-text fallbacks — emails with an HTML-only body (no text/plain part)
+    # are a strong spam signal to Gmail/Outlook filters. Including both parts
+    # in a multipart/alternative message is one of the biggest inbox-vs-spam factors.
+    items_plain = "\n".join(f"- {it['name']}: Rs. {it['price']:,.2f}" for it in items)
+    customer_plain = (
+        f"Thank you, {customer_name}!\n\nYour order #{order_id} has been received ({payment_method}).\n\n"
+        f"{items_plain}\n\nSubtotal: Rs. {subtotal:,.2f}\nDelivery Charge: Rs. {delivery_charge:,.2f}\n"
+        f"Grand Total: Rs. {grand_total:,.2f}\n\nDelivery Address: {full_address}\nContact: {phone}\n\n"
+        f"We'll notify you once your order ships. Thank you for shopping with {STORE_NAME}!"
+    )
+    admin_plain = (
+        f"New Order #{order_id} — Packing Required\nPayment: {payment_method}\n\n"
+        f"Customer: {customer_name}\nPhone: {phone}\nEmail: {customer_email or 'Not provided'}\n"
+        f"Address: {full_address}\n\n{items_plain}\n\nGrand Total: Rs. {grand_total:,.2f}\n\n"
+        f"Please prepare this order for packing & dispatch."
+    )
+
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
         server.login(gmail_sender, gmail_password)
         if customer_email:
             msg1 = MIMEMultipart("alternative")
-            msg1["Subject"] = f"✅ Order Confirmed — {STORE_NAME} (Order #{order_id})"
-            msg1["From"] = gmail_sender; msg1["To"] = customer_email
+            msg1["Subject"] = f"Order Confirmed - {STORE_NAME} (Order #{order_id})"
+            msg1["From"] = f"{STORE_NAME} <{gmail_sender}>"
+            msg1["To"] = customer_email
+            msg1["Reply-To"] = admin_email
+            # Plain-text part MUST be attached first, HTML second (multipart/alternative order).
+            msg1.attach(MIMEText(customer_plain, "plain"))
             msg1.attach(MIMEText(customer_body, "html"))
             server.sendmail(gmail_sender, customer_email, msg1.as_string())
         msg2 = MIMEMultipart("alternative")
-        msg2["Subject"] = f"📦 New Order #{order_id} — Packing Required"
-        msg2["From"] = gmail_sender; msg2["To"] = admin_email
+        msg2["Subject"] = f"New Order #{order_id} - Packing Required"
+        msg2["From"] = f"{STORE_NAME} <{gmail_sender}>"
+        msg2["To"] = admin_email
+        msg2.attach(MIMEText(admin_plain, "plain"))
         msg2.attach(MIMEText(admin_body, "html"))
         server.sendmail(gmail_sender, admin_email, msg2.as_string())
         server.quit()
@@ -312,7 +348,7 @@ def verify_safepay_payment(order_id):
 # ADMIN
 # ============================================================
 def admin_login_gate():
-    st.title("🔐 Admin Login")
+    st.title("🔐 Admin Login", anchor=False)
     pwd = st.text_input("Enter Admin Password", type="password")
     if st.button("Login", type="primary"):
         try:
@@ -325,11 +361,12 @@ def admin_login_gate():
             st.error("❌ Incorrect password.")
 
 def admin_panel():
-    st.sidebar.success("✅ Logged in as Admin")
-    if st.sidebar.button("Logout"):
+    top1, top2 = st.columns([4, 1])
+    top1.success("✅ Logged in as Admin")
+    if top2.button("Logout", use_container_width=True):
         st.session_state.is_admin = False; st.rerun()
 
-    st.title("🔐 Admin Dashboard")
+    st.title("🔐 Admin Dashboard", anchor=False)
     tab1, tab2 = st.tabs(["➕ Add Product", " Orders"])
 
     with tab1:
@@ -399,8 +436,6 @@ def render_header():
     h1, h2, h3 = st.columns([1, 3, 1])
     with h1:
         with st.popover("☰ Menu"):
-            if st.button("🏠 Home", use_container_width=True):
-                st.session_state.page = 'home'; st.session_state.cat_filter = 'All'; st.rerun()
             st.markdown("**Browse Categories**")
             for c in CATEGORIES:
                 if st.button(f"{CATEGORY_EMOJI[c]} {c}", key=f"menu_{c}", use_container_width=True):
@@ -442,6 +477,24 @@ def render_footer():
     if STORE_WHATSAPP:
         st.markdown(f'<a href="https://wa.me/{STORE_WHATSAPP}" target="_blank" class="sk-float-whatsapp">💬</a>',
                     unsafe_allow_html=True)
+
+def render_thank_you(order_id, customer_name):
+    st.balloons()
+    st.markdown(f"""
+    <div style="text-align:center; padding: 50px 20px; background:linear-gradient(135deg,#111,#333);
+                border-radius:20px; color:white; margin-bottom:20px;">
+        <div style="font-size:3.5rem;">🎉</div>
+        <h1 style="color:white; margin:10px 0 6px 0;">Thank You, {customer_name}!</h1>
+        <p style="color:#ddd; font-size:1.05rem;">Your order <b>#{order_id}</b> has been placed successfully.</p>
+        <p style="color:#bbb; font-size:0.9rem; margin-top:10px;">
+            We're already getting it ready for you — sit back and relax, it's on its way! 🚚
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    if st.button("🛍️ Continue Shopping", type="primary", use_container_width=True):
+        st.session_state.order_success = None
+        st.session_state.page = 'home'
+        st.rerun()
 
 def render_flash_banner():
     if st.session_state.flash_add:
@@ -552,7 +605,7 @@ def product_detail():
                     with thumbs[t]:
                         if st.button(f"{t+1}", key=f"th_{t}"): st.session_state.img_idx = t; st.rerun()
     with c2:
-        st.title(p['name'])
+        st.title(p['name'], anchor=False)
         price_block(p)
         st.write(p.get('description'))
         if p.get('youtube_url'):
@@ -570,7 +623,13 @@ def product_detail():
 # ============================================================
 def cart_page():
     render_header()
-    st.title("🛒 Your Cart")
+
+    if st.session_state.order_success:
+        render_thank_you(st.session_state.order_success["order_id"],
+                         st.session_state.order_success["name"])
+        render_footer(); return
+
+    st.title("🛒 Your Cart", anchor=False)
 
     if st.button("← Continue Shopping"):
         st.session_state.page = 'home'; st.rerun()
@@ -593,7 +652,8 @@ def cart_page():
     """, unsafe_allow_html=True)
 
     st.divider()
-    st.subheader("📍 Delivery Address")
+    st.subheader("📍 Delivery Address", anchor=False)
+    st.caption("Fields marked * are required. Everything else is optional — leave it blank if you like.")
 
     render_location_detector()
     qp = st.query_params
@@ -601,14 +661,14 @@ def cart_page():
     det_street = qp.get("det_street", "")
 
     nm = st.text_input("Full Name *")
-    em = st.text_input("Email (for order confirmation)")
+    em = st.text_input("Email * (order confirmation is sent here)")
     ph = st.text_input("Phone Number *")
     alt_ph = st.text_input("Alternative Phone Number (optional)")
     wa_num = st.text_input("WhatsApp Number (optional)")
 
     country = st.selectbox("Country *", ["Pakistan", "Other (not supported)"], index=0)
     city = st.text_input("City *", value=det_city)
-    street1 = st.text_input("Street Address 1 *", value=det_street)
+    street1 = st.text_input("Street Address / Full Address *", value=det_street)
     street2 = st.text_input("Street Address 2 (optional)")
 
     if country != "Pakistan":
@@ -616,7 +676,7 @@ def cart_page():
                   "or check back later as we expand.")
 
     st.divider()
-    st.subheader("💳 Payment Method")
+    st.subheader("💳 Payment Method", anchor=False)
     payment_method = st.radio("Choose how you'd like to pay",
                                ["💵 Cash on Delivery", "💳 Pay Online (Credit / Debit Card)"])
 
@@ -633,8 +693,8 @@ def cart_page():
     place_disabled = (country != "Pakistan")
 
     if st.button("✅ Place Order", type="primary", use_container_width=True, disabled=place_disabled):
-        if not (nm and ph and city and street1):
-            st.warning("⚠️ Please fill Name, Phone, City and Street Address.")
+        if not (nm and em and ph and city and street1):
+            st.warning("⚠️ Please fill the required fields: Name, Email, Phone, City and Address.")
         else:
             full_address = f"{street1}, {street2 + ', ' if street2 else ''}{city}, {country}"
             items_payload = [{"name": x['name'], "price": x['price']} for x in st.session_state.cart]
@@ -656,7 +716,8 @@ def cart_page():
                     ok, msg = send_order_emails(order_id, nm, em, ph, alt_ph, wa_num, full_address,
                                                  items_payload, subtotal, DELIVERY_CHARGE, grand_total, "Cash on Delivery")
                     if not ok: st.warning(f"Order placed, but email failed: {msg}")
-                    st.success("🎉 Order placed! You'll pay cash on delivery. A confirmation has been sent.")
+                    decrement_stock(st.session_state.cart)
+                    st.session_state.order_success = {"order_id": order_id, "name": nm}
                     st.session_state.cart = []; st.rerun()
                 else:
                     if not safepay_configured():
@@ -688,11 +749,17 @@ def order_result_page():
         confirmed = verify_safepay_payment(order_id)
         if confirmed:
             try:
+                order_row = supabase_admin.table("orders").select("*").eq("id", order_id).single().execute().data
                 supabase_admin.table("orders").update({"payment_status": "Paid"}).eq("id", order_id).execute()
+                if st.session_state.cart:
+                    decrement_stock(st.session_state.cart)
+                customer_name = order_row.get("customer_name", "there") if order_row else "there"
             except Exception:
-                pass
-            st.success(f"🎉 Payment confirmed for Order #{order_id}! Thank you for shopping with us.")
+                customer_name = "there"
             st.session_state.cart = []
+            render_thank_you(order_id, customer_name)
+            render_footer()
+            return
         else:
             st.warning(f"We couldn't verify payment for Order #{order_id} yet. If money was deducted, "
                        f"please contact support with your order ID — do not pay again.")
